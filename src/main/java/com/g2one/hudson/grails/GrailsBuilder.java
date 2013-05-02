@@ -2,8 +2,11 @@ package com.g2one.hudson.grails;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.PrintStream;
+import java.io.PrintWriter;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 
@@ -28,22 +31,16 @@ import hudson.model.Hudson;
 import hudson.model.Result;
 import hudson.tasks.Builder;
 import hudson.util.ArgumentListBuilder;
-
-import java.io.File;
-import java.io.IOException;
-import java.io.PrintStream;
-import java.io.PrintWriter;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.LinkedList;
-import java.util.Map;
+import hudson.util.VariableResolver;
 
 import net.sf.json.JSONObject;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.StaplerRequest;
 
 public class GrailsBuilder extends Builder {
+
+    private static final String JAVA_OPTS = "JAVA_OPTS";
+    private static final String JENKINS_7702_TRIGGER = "-Djava.util.logging.manager=org.apache.juli.ClassLoaderLogManager";
 
     private final String targets;
     private final String name;
@@ -85,19 +82,19 @@ public class GrailsBuilder extends Builder {
     public void setNonInteractive(Boolean b) {
         nonInteractive = b;
     }
-    
+
     public boolean getForceUpgrade() {
         return forceUpgrade;
     }
-    
+
     public void setForceUpgrade(Boolean b) {
         forceUpgrade = b;
     }
-    
+
     public String getProperties() {
         return properties;
     }
-    
+
     public void setProperties(String properties) {
         this.properties = properties;
     }
@@ -203,7 +200,9 @@ public class GrailsBuilder extends Builder {
     @Override
     public boolean perform(AbstractBuild<?, ?> build, Launcher launcher, BuildListener listener) throws IOException, InterruptedException {
         readResolve();
-        List<String[]> targetsToRun = getTargetsToRun();
+        EnvVars env = build.getEnvironment(listener);
+        List<String[]> targetsToRun = getTargetsToRun(env);
+
         if (targetsToRun.size() > 0) {
             String execName;
             if (useWrapper) {
@@ -213,7 +212,6 @@ public class GrailsBuilder extends Builder {
                 execName = launcher.isUnix() ? "grails" : "grails.bat";
             }
 
-            EnvVars env = build.getEnvironment(listener);
 
             GrailsInstallation grailsInstallation = useWrapper ? null : getGrails();
 
@@ -222,6 +220,13 @@ public class GrailsBuilder extends Builder {
                     .forNode(Computer.currentComputer().getNode(), listener);
                 env.put("GRAILS_HOME", grailsInstallation.getHome());
             }
+
+            String jopts = env.get(JAVA_OPTS);
+            if (jopts != null && jopts.contains(JENKINS_7702_TRIGGER)) {
+                listener.getLogger().println("[JENKINS-7702] sanitizing $" + JAVA_OPTS);
+                env.put(JAVA_OPTS, jopts.replace(JENKINS_7702_TRIGGER, "")); // leading/trailing spaces should be harmless
+            }
+
             for (String[] targetsAndArgs : targetsToRun) {
 
                 String target = targetsAndArgs[0];
@@ -230,12 +235,12 @@ public class GrailsBuilder extends Builder {
                 if (grailsInstallation == null) {
                     args.add(execName);
                 } else {
-                    File exec = grailsInstallation.getExecutable();
-                    if (!new FilePath(launcher.getChannel(), grailsInstallation.getExecutable().getPath()).exists()) {
+                    FilePath exec = new FilePath(launcher.getChannel(), grailsInstallation.getHome()).child("bin").child(execName);
+                    if (!exec.exists()) {
                         listener.fatalError(exec + " doesn't exist");
                         return false;
                     }
-                    args.add(exec.getPath());
+                    args.add(exec.getRemote());
                 }
                 args.addKeyValuePairs("-D", build.getBuildVariables());
                 Map systemProperties = new HashMap();
@@ -322,6 +327,7 @@ public class GrailsBuilder extends Builder {
      */
     @SuppressWarnings({"StaticMethodOnlyUsedInOneClass", "TypeMayBeWeakened"})
     static String evalTarget(Map<String, String> env, String target) {
+        target = Util.replaceMacro(target, new VariableResolver.ByMap<String>(env));
         Binding binding = new Binding();
         binding.setVariable("env", env);
         binding.setVariable("sys", System.getProperties());
@@ -334,21 +340,22 @@ public class GrailsBuilder extends Builder {
         }
     }
 
-    protected List<String[]> getTargetsToRun() {
+    protected List<String[]> getTargetsToRun(EnvVars env) {
         List<String[]> targetsToRun = new ArrayList<String[]>();
         if(forceUpgrade) {
             targetsToRun.add(new String[]{"upgrade", "--non-interactive"});
         }
         if (targets != null && targets.length() > 0) {
             try {
+                String targetsEval = this.targets;
                 JSAP jsap = new JSAP();
                 UnflaggedOption option = new UnflaggedOption("targets");
                 option.setGreedy(true);
                 jsap.registerParameter(option);
-                JSAPResult jsapResult = jsap.parse(this.targets);
+                JSAPResult jsapResult = jsap.parse(targetsEval);
                 String[] targets = jsapResult.getStringArray("targets");
                 for (String targetAndArgs : targets) {
-                    String[] pieces = targetAndArgs.split(" ");
+                    String[] pieces = evalTarget(env, targetAndArgs).split(" ");
                     targetsToRun.add(pieces);
                 }
             } catch (Exception e) {
